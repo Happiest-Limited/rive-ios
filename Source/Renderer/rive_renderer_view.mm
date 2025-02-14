@@ -154,7 +154,10 @@
     RenderContext* _renderContext;
     rive::Renderer* _renderer;
     dispatch_queue_t _renderQueue;
-    CADisplayLink* _displayLink;  // Add this for iOS
+    CADisplayLink* _displayLink;
+    NSMutableArray<id<CAMetalDrawable>>* _drawablePool;
+    dispatch_semaphore_t _drawableSemaphore;
+    NSLock* _drawableLock;
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -262,53 +265,98 @@
     [self setFramebufferOnly:_renderContext.framebufferOnly];
     [self setSampleCount:1];
     
+    // Initialize drawable management
+    _drawablePool = [NSMutableArray arrayWithCapacity:3];
+    _drawableSemaphore = dispatch_semaphore_create(3);
+    _drawableLock = [[NSLock alloc] init];
+    
     // Disable automatic drawing
     self.enableSetNeedsDisplay = NO;
     self.paused = YES;
     
-    // Set up our own display link
+    // Set up display link
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
     [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
-- (void)handleDisplayLink:(CADisplayLink*)displayLink 
-{
-    // Dispatch the actual drawing to our background queue
-    dispatch_async(_renderQueue, ^{
-        [self drawInRect:self.bounds withCompletion:NULL];
+- (void)prefetchDrawables {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (int i = 0; i < 3; i++) {
+            id<CAMetalDrawable> drawable = [self metalLayer].nextDrawable;
+            if (drawable) {
+                [_drawableLock lock];
+                [_drawablePool addObject:drawable];
+                [_drawableLock unlock];
+            }
+        }
     });
 }
 
-// Override to prevent main thread drawing
-- (void)draw
-{
-    // Do nothing - we handle drawing via display link
-}
-
-- (void)drawRect:(CGRect)rect
-{
-    // Do nothing - we handle drawing via display link
-}
-
-// Update currentDrawable to be more efficient
 - (nullable id<CAMetalDrawable>)currentDrawable
 {
-    // If we're on the main thread, dispatch to background
-    if ([NSThread isMainThread]) {
-        return nil; // Don't block main thread
+    // Try to get a drawable from the pool first
+    [_drawableLock lock];
+    id<CAMetalDrawable> drawable = [_drawablePool firstObject];
+    if (drawable) {
+        [_drawablePool removeObjectAtIndex:0];
+        [_drawableLock unlock];
+        
+        // Prefetch a new drawable to replace the one we just took
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id<CAMetalDrawable> newDrawable = [self metalLayer].nextDrawable;
+            if (newDrawable) {
+                [_drawableLock lock];
+                [_drawablePool addObject:newDrawable];
+                [_drawableLock unlock];
+            }
+        });
+        
+        return drawable;
     }
+    [_drawableLock unlock];
     
-    __block id<CAMetalDrawable> drawable = nil;
+    // If pool is empty, try to get a new drawable with a short timeout
+    __block id<CAMetalDrawable> newDrawable = nil;
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        drawable = [self metalLayer].nextDrawable;
+        newDrawable = [self metalLayer].nextDrawable;
         dispatch_semaphore_signal(semaphore);
     });
     
-    // Wait with a short timeout
-    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC));
-    return drawable;
+    // Wait with a very short timeout
+    if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_MSEC)) == 0) {
+        return newDrawable;
+    }
+    
+    return nil;
+}
+
+- (void)startAnimation 
+{
+    // Prefetch drawables before starting animation
+    [self prefetchDrawables];
+    _displayLink.paused = NO;
+}
+
+- (void)stopAnimation 
+{
+    _displayLink.paused = YES;
+    
+    // Clear the drawable pool
+    [_drawableLock lock];
+    [_drawablePool removeAllObjects];
+    [_drawableLock unlock];
+}
+
+- (void)handleDisplayLink:(CADisplayLink*)displayLink 
+{
+    // Check if we have drawables available before dispatching
+    if (_drawablePool.count > 0) {
+        dispatch_async(_renderQueue, ^{
+            [self drawInRect:self.bounds withCompletion:NULL];
+        });
+    }
 }
 
 - (void)drawInRect:(CGRect)rect
@@ -354,21 +402,18 @@
     _renderer = nil;
 }
 
-// Add methods to control animation
-- (void)startAnimation 
+- (void)drawRect:(CGRect)rect
 {
-    _displayLink.paused = NO;
-}
-
-- (void)stopAnimation 
-{
-    _displayLink.paused = YES;
+    // Do nothing - we handle drawing via display link
 }
 
 - (void)dealloc 
 {
+    [self stopAnimation];
     [_displayLink invalidate];
     _displayLink = nil;
+    _drawableLock = nil;
+    _drawablePool = nil;
 }
 
 - (void)alignWithRect:(CGRect)rect
