@@ -18,136 +18,44 @@
 #include "rive/audio/audio_engine.hpp"
 
 #if TARGET_OS_VISION
+@interface RiveMTKView : UIView <RiveMetalDrawableView>
+#else
+@interface RiveMTKView : UIView <RiveMetalDrawableView>  // Changed from MTKView
+#endif
+
+@property(nonatomic) MTLPixelFormat colorPixelFormat;
+@property(nonatomic) CGSize drawableSize;
+@property(nonatomic) BOOL framebufferOnly;
+@property(nonatomic) NSInteger sampleCount;
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic) MTLPixelFormat depthStencilPixelFormat;
+@property(nonatomic) BOOL enableSetNeedsDisplay;
+@property(nonatomic) BOOL paused;
+
+@end
+
 @implementation RiveMTKView
-{
-    id<CAMetalDrawable> _currentDrawable;
-}
 
-@synthesize enableSetNeedsDisplay;
-
-@synthesize paused;
-
-@synthesize sampleCount;
-
-@synthesize depthStencilPixelFormat;
-
-- (instancetype)initWithFrame:(CGRect)frameRect device:(id<MTLDevice>)device
-{
-    self = [super initWithFrame:frameRect];
-    self.device = device;
-    return self;
-}
-
-+ (Class)layerClass
-{
++ (Class)layerClass {
     return [CAMetalLayer class];
 }
 
-- (nullable id<MTLDevice>)device
-{
-    return [self metalLayer].device;
+- (CAMetalLayer *)metalLayer {
+    return (CAMetalLayer *)self.layer;
 }
 
-- (void)setDevice:(nullable id<MTLDevice>)device
-{
-    [self metalLayer].device = device;
+- (void)setDevice:(id<MTLDevice>)device {
+    _device = device;
+    self.metalLayer.device = device;
 }
 
-- (CAMetalLayer*)metalLayer
-{
-    return (CAMetalLayer*)self.layer;
+- (id<CAMetalDrawable>)currentDrawable {
+    return self.metalLayer.nextDrawable;
 }
 
-- (void)setFramebufferOnly:(BOOL)framebufferOnly
-{
-    [self metalLayer].framebufferOnly = framebufferOnly;
-}
-
-- (BOOL)framebufferOnly
-{
-    return [self metalLayer].framebufferOnly;
-}
-
-- (void)setCurrentDrawable:(id<CAMetalDrawable> _Nullable)currentDrawable
-{
-    return;
-}
-
-- (nullable id<CAMetalDrawable>)currentDrawable
-{
-    if (_currentDrawable == nil)
-    {
-        _currentDrawable = [self metalLayer].nextDrawable;
-    }
-    return _currentDrawable;
-}
-
-- (void)setColorPixelFormat:(MTLPixelFormat)colorPixelFormat
-{
-    [self metalLayer].pixelFormat = colorPixelFormat;
-}
-
-- (MTLPixelFormat)colorPixelFormat
-{
-    return [self metalLayer].pixelFormat;
-}
-
-- (void)setDrawableSize:(CGSize)drawableSize
-{
-    [self metalLayer].drawableSize = drawableSize;
-}
-
-- (CGSize)drawableSize
-{
-    return [self metalLayer].drawableSize;
-}
-
-- (void)_updateDrawableSizeFromBounds
-{
-    CGSize newSize = self.bounds.size;
-    newSize.width *= self.traitCollection.displayScale;
-    newSize.height *= self.traitCollection.displayScale;
-    self.drawableSize = newSize;
-}
-
-- (void)setContentScaleFactor:(CGFloat)contentScaleFactor
-{
-    [super setContentScaleFactor:contentScaleFactor];
-    [self _updateDrawableSizeFromBounds];
-}
-
-- (void)layoutSubviews
-{
-    [super layoutSubviews];
-    [self _updateDrawableSizeFromBounds];
-}
-
-- (void)setFrame:(CGRect)frame
-{
-    [super setFrame:frame];
-    [self _updateDrawableSizeFromBounds];
-}
-
-- (void)setBounds:(CGRect)bounds
-{
-    [super setBounds:bounds];
-    [self _updateDrawableSizeFromBounds];
-}
-
-// For some reason, when setNeedsDisplay is called, drawRect is not called
-// But, we get a delegate callback when the layer should be displayed,
-// so we'll just piggyback off of that and draw for now.
-- (void)displayLayer:(CALayer*)layer
-{
-    _currentDrawable = [self metalLayer].nextDrawable;
-    [self drawRect:self.bounds];
-}
+// ... implement other required properties ...
 
 @end
-#else
-@implementation RiveMTKView
-@end
-#endif
 
 @implementation RiveRendererView
 {
@@ -258,29 +166,20 @@
     _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
     _renderContext = [[RenderContextManager shared] getDefaultContext];
     assert(_renderContext);
-    self.device = [_renderContext metalDevice];
-
-    [self setDepthStencilPixelFormat:_renderContext.depthStencilPixelFormat];
-    [self setColorPixelFormat:MTLPixelFormatBGRA8Unorm];
-    [self setFramebufferOnly:_renderContext.framebufferOnly];
-    [self setSampleCount:1];
+    
+    // Configure metal layer
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    metalLayer.device = [_renderContext metalDevice];
+    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.framebufferOnly = YES;
+    metalLayer.presentsWithTransaction = NO;
+    metalLayer.displaySyncEnabled = NO;
+    metalLayer.allowsNextDrawableTimeout = NO;  // Important: prevent timeout blocking
     
     // Initialize drawable management
     _drawablePool = [NSMutableArray arrayWithCapacity:3];
     _drawableLock = [[NSLock alloc] init];
     _isDrawing = NO;
-    
-    // Completely disable MTKView's drawing mechanism
-    self.enableSetNeedsDisplay = NO;
-    self.paused = YES;
-    self.preferredFramesPerSecond = 60;  // Set default FPS
-    
-    // Important: Override the layer class and delegate
-    if ([self.layer isKindOfClass:[CAMetalLayer class]]) {
-        CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
-        metalLayer.presentsWithTransaction = NO;  // This is key to prevent main thread blocking
-        metalLayer.displaySyncEnabled = NO;       // Disable vsync to prevent blocking
-    }
     
     // Set up display link
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
@@ -303,8 +202,10 @@
 
 - (nullable id<CAMetalDrawable>)currentDrawable
 {
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    
     if ([NSThread isMainThread]) {
-        return [self.metalLayer nextDrawable];
+        return [metalLayer nextDrawable];
     }
     
     [_drawableLock lock];
@@ -313,9 +214,8 @@
         [_drawablePool removeObjectAtIndex:0];
         [_drawableLock unlock];
         
-        // Prefetch next drawable
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (id<CAMetalDrawable> newDrawable = [self.metalLayer nextDrawable]) {
+            if (id<CAMetalDrawable> newDrawable = [metalLayer nextDrawable]) {
                 [self->_drawableLock lock];
                 [self->_drawablePool addObject:newDrawable];
                 [self->_drawableLock unlock];
@@ -325,10 +225,9 @@
     }
     [_drawableLock unlock];
     
-    // If no drawable in pool, get one from main thread
     __block id<CAMetalDrawable> newDrawable = nil;
     dispatch_sync(dispatch_get_main_queue(), ^{
-        newDrawable = [self.metalLayer nextDrawable];
+        newDrawable = [metalLayer nextDrawable];
     });
     return newDrawable;
 }
@@ -612,10 +511,14 @@
 - (void)layoutSubviews 
 {
     [super layoutSubviews];
-    // Update drawable size without triggering a draw
+    
     CGSize size = self.bounds.size;
     CGFloat scale = self.window.screen.scale;
-    self.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
+    
+    // Update metal layer size
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
+    self.drawableSize = metalLayer.drawableSize;
 }
 
 @end
