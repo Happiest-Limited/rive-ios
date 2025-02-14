@@ -275,10 +275,14 @@
     self.paused = YES;
     self.preferredFramesPerSecond = 60;  // Set default FPS
     
-    // Override the layer class
-    self.layer.delegate = self;
+    // Important: Override the layer class and delegate
+    if ([self.layer isKindOfClass:[CAMetalLayer class]]) {
+        CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+        metalLayer.presentsWithTransaction = NO;  // This is key to prevent main thread blocking
+        metalLayer.displaySyncEnabled = NO;       // Disable vsync to prevent blocking
+    }
     
-    // Set up our own display link
+    // Set up display link
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
     _displayLink.paused = YES;
     [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -403,7 +407,7 @@
 
 - (void)drawRect:(CGRect)rect 
 {
-    // Completely disable MTKView drawing
+    // Do nothing - prevent MTKView from drawing
 }
 
 - (void)display 
@@ -597,6 +601,21 @@
     rive::Vec2D convertedLocation = inverse * frameLocation;
 
     return CGPointMake(convertedLocation.x, convertedLocation.y);
+}
+
+// Override to prevent MTKView from drawing
+- (void)setNeedsDisplay 
+{
+    // Do nothing - prevent MTKView from triggering draws
+}
+
+- (void)layoutSubviews 
+{
+    [super layoutSubviews];
+    // Update drawable size without triggering a draw
+    CGSize size = self.bounds.size;
+    CGFloat scale = self.window.screen.scale;
+    self.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
 }
 
 @end

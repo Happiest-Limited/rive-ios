@@ -73,13 +73,19 @@ open class RiveView: RiveRendererView {
 
     open override var bounds: CGRect {
         didSet {
-            redraw()
+            // Update size without triggering a draw
+            let size = bounds.size
+            let scale = window?.screen.scale ?? 1.0
+            drawableSize = CGSize(width: size.width * scale, height: size.height * scale)
         }
     }
 
     open override var frame: CGRect {
         didSet {
-            redraw()
+            // Update size without triggering a draw
+            let size = bounds.size
+            let scale = window?.screen.scale ?? 1.0
+            drawableSize = CGSize(width: size.width * scale, height: size.height * scale)
         }
     }
 
@@ -167,10 +173,12 @@ open class RiveView: RiveRendererView {
     }
 
     private func redraw() {
+        // Only redraw if we're not playing
         if !isPlaying {
-            let bounds = self.bounds
-            DispatchQueue.global(qos: .userInteractive).async {
-                self.drawInRect(bounds, withCompletion: nil)
+            // Dispatch directly to render queue
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                guard let self = self else { return }
+                self.drawInRect(self.bounds, withCompletion: nil)
             }
         }
     }
@@ -267,11 +275,10 @@ open class RiveView: RiveRendererView {
     
     private func startTimer() {
         stopTimer()
-        
         displayLinkProxy = DisplayLinkProxy(
             handle: { [weak self] in
                 guard let self = self else { return }
-                
+                // Let the Obj-C display link handle the drawing
                 self.eventQueue.fireAll()
             },
             to: .main,
@@ -659,6 +666,11 @@ open class RiveView: RiveRendererView {
             fpsCounter?.removeFromSuperview()
             fpsCounter = nil
         }
+    }
+
+    // Override to prevent MTKView's draw cycle
+    open override func setNeedsDisplay() {
+        // Do nothing - prevent MTKView from triggering draws
     }
 }
 
