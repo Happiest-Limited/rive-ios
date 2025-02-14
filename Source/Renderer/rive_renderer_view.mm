@@ -154,6 +154,7 @@
     RenderContext* _renderContext;
     rive::Renderer* _renderer;
     dispatch_queue_t _renderQueue;
+    CADisplayLink* _displayLink;  // Add this for iOS
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -202,18 +203,7 @@
     self = [super initWithCoder:decoder];
 
     if (self) {
-        // Create a serial queue for rendering
-        _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
-        
-        // Rest of existing initialization
-        _renderContext = [[RenderContextManager shared] getDefaultContext];
-        assert(_renderContext);
-        self.device = [_renderContext metalDevice];
-
-        [self setDepthStencilPixelFormat:_renderContext.depthStencilPixelFormat];
-        [self setColorPixelFormat:MTLPixelFormatBGRA8Unorm];
-        [self setFramebufferOnly:_renderContext.framebufferOnly];
-        [self setSampleCount:1];
+        [self commonInit];
     }
     return self;
 }
@@ -255,7 +245,130 @@
     [self setFramebufferOnly:_renderContext.framebufferOnly];
     [self setSampleCount:1];
 
+    [self commonInit];
+
     return value;
+}
+
+- (void)commonInit 
+{
+    _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
+    _renderContext = [[RenderContextManager shared] getDefaultContext];
+    assert(_renderContext);
+    self.device = [_renderContext metalDevice];
+
+    [self setDepthStencilPixelFormat:_renderContext.depthStencilPixelFormat];
+    [self setColorPixelFormat:MTLPixelFormatBGRA8Unorm];
+    [self setFramebufferOnly:_renderContext.framebufferOnly];
+    [self setSampleCount:1];
+    
+    // Disable automatic drawing
+    self.enableSetNeedsDisplay = NO;
+    self.paused = YES;
+    
+    // Set up our own display link
+    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)handleDisplayLink:(CADisplayLink*)displayLink 
+{
+    // Dispatch the actual drawing to our background queue
+    dispatch_async(_renderQueue, ^{
+        [self drawInRect:self.bounds withCompletion:NULL];
+    });
+}
+
+// Override to prevent main thread drawing
+- (void)draw
+{
+    // Do nothing - we handle drawing via display link
+}
+
+- (void)drawRect:(CGRect)rect
+{
+    // Do nothing - we handle drawing via display link
+}
+
+// Update currentDrawable to be more efficient
+- (nullable id<CAMetalDrawable>)currentDrawable
+{
+    // If we're on the main thread, dispatch to background
+    if ([NSThread isMainThread]) {
+        return nil; // Don't block main thread
+    }
+    
+    __block id<CAMetalDrawable> drawable = nil;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        drawable = [self metalLayer].nextDrawable;
+        dispatch_semaphore_signal(semaphore);
+    });
+    
+    // Wait with a short timeout
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC));
+    return drawable;
+}
+
+- (void)drawInRect:(CGRect)rect
+    withCompletion:(_Nullable MTLCommandBufferHandler)completionHandler
+{
+    if ([NSThread isMainThread]) {
+        return; // Don't draw on main thread
+    }
+
+    CGFloat scale = -1;
+#if TARGET_OS_IPHONE
+    scale = self.traitCollection.displayScale;
+#else
+    scale = self.window.backingScaleFactor;
+#endif
+
+    if ([_renderContext canDrawInRect:rect
+                        drawableSize:self.drawableSize
+                               scale:scale] == NO)
+    {
+        return;
+    }
+
+    id<CAMetalDrawable> drawable = [self currentDrawable];
+    if (!drawable) {
+        return;
+    }
+
+    _renderer = [_renderContext beginFrame:self];
+    if (_renderer != nil)
+    {
+        _renderer->save();
+        [self drawRive:rect size:self.drawableSize];
+        _renderer->restore();
+        
+        [_renderContext endFrame:self withCompletion:^(id<MTLCommandBuffer> buffer) {
+            if (completionHandler) {
+                completionHandler(buffer);
+            }
+        }];
+    }
+    
+    _renderer = nil;
+}
+
+// Add methods to control animation
+- (void)startAnimation 
+{
+    _displayLink.paused = NO;
+}
+
+- (void)stopAnimation 
+{
+    _displayLink.paused = YES;
+}
+
+- (void)dealloc 
+{
+    [_displayLink invalidate];
+    _displayLink = nil;
 }
 
 - (void)alignWithRect:(CGRect)rect
@@ -330,95 +443,6 @@
 - (bool)isPaused
 {
     return true;
-}
-
-- (void)drawInRect:(CGRect)rect
-    withCompletion:(_Nullable MTLCommandBufferHandler)completionHandler
-{
-    // Capture scale on main thread
-    CGFloat scale = -1;
-#if TARGET_OS_IPHONE
-    CGFloat displayScale = self.traitCollection.displayScale;
-    if (displayScale > 0)
-    {
-        scale = displayScale;
-    }
-#else
-    NSWindow* window = self.window;
-    if (self.window != nil)
-    {
-        scale = window.backingScaleFactor;
-    }
-#endif
-
-    // If we're on the main thread, dispatch to background
-    if ([NSThread isMainThread]) {
-        dispatch_async(_renderQueue, ^{
-            [self drawInRect:rect withCompletion:completionHandler];
-        });
-        return;
-    }
-
-    // Check if we can draw
-    if ([_renderContext canDrawInRect:rect
-                        drawableSize:self.drawableSize
-                               scale:scale] == NO)
-    {
-        return;
-    }
-
-    // Get drawable (now with retry logic built into currentDrawable)
-    id<CAMetalDrawable> drawable = [self currentDrawable];
-    if (!drawable.texture)
-    {
-        // If we couldn't get a drawable, schedule another draw
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self setNeedsDisplay:YES];
-        });
-        return;
-    }
-
-    _renderer = [_renderContext beginFrame:self];
-    if (_renderer != nil)
-    {
-        _renderer->save();
-        [self drawRive:rect size:self.drawableSize];
-        _renderer->restore();
-    }
-    
-    // Complete rendering and present
-    [_renderContext endFrame:self withCompletion:^(id<MTLCommandBuffer> _Nonnull buffer) {
-        // Handle completion on main thread if needed
-        if (completionHandler) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler(buffer);
-            });
-        }
-        
-        // Update view state on main thread
-        dispatch_async(dispatch_get_main_queue(), ^{
-            bool paused = [self isPaused];
-            [self setEnableSetNeedsDisplay:paused];
-            [self setPaused:paused];
-        });
-    }];
-
-    _renderer = nil;
-}
-
-- (void)drawRect:(CGRect)rect
-{
-    [super drawRect:rect];
-    
-    // If we're on the main thread, dispatch to background
-    if ([NSThread isMainThread]) {
-        dispatch_async(_renderQueue, ^{
-            [self drawInRect:rect withCompletion:NULL];
-        });
-        return;
-    }
-    
-    [self drawInRect:rect withCompletion:NULL];
 }
 
 - (rive::Fit)riveFit:(RiveFit)fit
@@ -524,35 +548,6 @@
     rive::Vec2D convertedLocation = inverse * frameLocation;
 
     return CGPointMake(convertedLocation.x, convertedLocation.y);
-}
-
-// Update currentDrawable implementation to avoid blocking main thread
-- (nullable id<CAMetalDrawable>)currentDrawable
-{
-    // If we're on the main thread, return immediately to avoid blocking
-    if ([NSThread isMainThread]) {
-        return [self metalLayer].nextDrawable;
-    }
-    
-    // If we're already on a background thread, we can try a few times with shorter timeouts
-    for (int attempt = 0; attempt < 3; attempt++) {
-        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-        __block id<CAMetalDrawable> drawable = nil;
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            drawable = [self metalLayer].nextDrawable;
-            dispatch_semaphore_signal(semaphore);
-        });
-        
-        // Use a shorter timeout (16ms = roughly one frame)
-        if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC)) == 0) {
-            if (drawable) {
-                return drawable;
-            }
-        }
-    }
-    
-    return nil;
 }
 
 @end
