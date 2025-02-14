@@ -66,6 +66,7 @@
     NSMutableArray<id<CAMetalDrawable>>* _drawablePool;
     NSLock* _drawableLock;
     BOOL _isDrawing;
+    CFTimeInterval _lastFrameTime;
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -181,8 +182,13 @@
     _drawableLock = [[NSLock alloc] init];
     _isDrawing = NO;
     
-    // Set up display link
+    _lastFrameTime = 0;
+    
+    // Configure display link for optimal performance
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+    if (@available(iOS 15.0, *)) {
+        _displayLink.preferredFrameRateRange = CAFrameRateRange.defaultRange;
+    }
     _displayLink.paused = YES;
     [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
@@ -204,16 +210,14 @@
 {
     CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
     
-    if ([NSThread isMainThread]) {
-        return [metalLayer nextDrawable];
-    }
-    
+    // Always try pool first to avoid blocking
     [_drawableLock lock];
     id<CAMetalDrawable> drawable = [_drawablePool firstObject];
     if (drawable) {
         [_drawablePool removeObjectAtIndex:0];
         [_drawableLock unlock];
         
+        // Prefetch next drawable without blocking
         dispatch_async(dispatch_get_main_queue(), ^{
             if (id<CAMetalDrawable> newDrawable = [metalLayer nextDrawable]) {
                 [self->_drawableLock lock];
@@ -225,11 +229,8 @@
     }
     [_drawableLock unlock];
     
-    __block id<CAMetalDrawable> newDrawable = nil;
-    dispatch_sync(dispatch_get_main_queue(), ^{
-        newDrawable = [metalLayer nextDrawable];
-    });
-    return newDrawable;
+    // If no drawable in pool, try a quick non-blocking get
+    return [metalLayer nextDrawable];
 }
 
 - (void)startAnimation 
@@ -253,12 +254,21 @@
 {
     if (_isDrawing) return;
     
-    _isDrawing = YES;
-    dispatch_async(_renderQueue, ^{
-        [self drawInRect:self.bounds withCompletion:^(id<MTLCommandBuffer> _Nullable buffer) {
-            self->_isDrawing = NO;
-        }];
-    });
+    // Throttle frame rate
+    CFTimeInterval currentTime = CACurrentMediaTime();
+    CFTimeInterval deltaTime = currentTime - _lastFrameTime;
+    
+    // Target ~60fps
+    if (deltaTime >= 0.016) {
+        _isDrawing = YES;
+        _lastFrameTime = currentTime;
+        
+        dispatch_async(_renderQueue, ^{
+            [self drawInRect:self.bounds withCompletion:^(id<MTLCommandBuffer> buffer) {
+                self->_isDrawing = NO;
+            }];
+        });
+    }
 }
 
 - (void)drawInRect:(CGRect)rect

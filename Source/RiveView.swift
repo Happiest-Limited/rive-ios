@@ -275,10 +275,23 @@ open class RiveView: RiveRendererView {
     
     private func startTimer() {
         stopTimer()
+        
         displayLinkProxy = DisplayLinkProxy(
             handle: { [weak self] in
                 guard let self = self else { return }
-                // Let the Obj-C display link handle the drawing
+                
+                // Dispatch drawing to background queue
+                DispatchQueue.global(qos: .userInteractive).async {
+                    self.drawInRect(self.bounds) { buffer in
+                        // Handle completion on main queue if needed
+                        if let completion = buffer?.handler {
+                            DispatchQueue.main.async {
+                                completion()
+                            }
+                        }
+                    }
+                }
+                
                 self.eventQueue.fireAll()
             },
             to: .main,
@@ -709,22 +722,40 @@ open class RiveView: RiveRendererView {
 #if os(iOS) || os(visionOS) || os(tvOS)
     fileprivate class DisplayLinkProxy {
         var displayLink: CADisplayLink?
-        var handle: (() -> Void)?
+        private var handle: (() -> Void)?
         private var runloop: RunLoop
         private var mode: RunLoop.Mode
-
+        private var lastFrameTime: CFTimeInterval = 0
+        
         init(handle: (() -> Void)?, to runloop: RunLoop, forMode mode: RunLoop.Mode) {
             self.handle = handle
             self.runloop = runloop
             self.mode = mode
+            
+            // Create display link with custom preferences
             displayLink = CADisplayLink(target: self, selector: #selector(updateHandle))
+            displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
+            
+            // Important: Don't synchronize with display refresh
+            if #available(iOS 15.0, *) {
+                displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
+            }
+            
             displayLink?.add(to: runloop, forMode: mode)
         }
-
+        
         @objc func updateHandle() {
-            handle?()
+            // Throttle updates to avoid overwhelming the renderer
+            let currentTime = CACurrentMediaTime()
+            let deltaTime = currentTime - lastFrameTime
+            
+            // Aim for ~60fps (16.7ms between frames)
+            if deltaTime >= 0.016 {
+                handle?()
+                lastFrameTime = currentTime
+            }
         }
-
+        
         func invalidate() {
             displayLink?.remove(from: runloop, forMode: mode)
             displayLink?.invalidate()
