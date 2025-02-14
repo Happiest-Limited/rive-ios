@@ -282,26 +282,22 @@ open class RiveView: RiveRendererView {
             handle: { [weak self] in
                 guard let self = self else { return }
                 
-                // Dispatch drawing to background queue immediately
-                DispatchQueue.global(qos: .userInteractive).async {
-                    if !self.isDrawing {
-                        self.isDrawing = true
-                        self.drawInRect(self.bounds) { buffer in
-                            self.isDrawing = false
-                            // Handle completion on main queue if needed
-                            if let completion = buffer?.handler {
-                                DispatchQueue.main.async {
-                                    completion()
-                                }
-                            }
+                if !self.isDrawing {
+                    self.isDrawing = true
+                    self.drawInRect(self.bounds) { buffer in
+                        self.isDrawing = false
+                        // Handle completion on render queue
+                        if let completion = buffer?.handler {
+                            completion()
                         }
                     }
                 }
                 
-                self.eventQueue.fireAll()
-            },
-            to: .main,
-            forMode: .common
+                // Execute events on main queue since they might involve UI updates
+                DispatchQueue.main.async {
+                    self.eventQueue.fireAll()
+                }
+            }
         )
     }
     
@@ -735,33 +731,35 @@ open class RiveView: RiveRendererView {
         private var handle: (() -> Void)?
         private var lastFrameTime: CFTimeInterval = 0
         private let renderQueue: DispatchQueue
+        private let renderThread: Thread
         
-        init(handle: (() -> Void)?, to runloop: RunLoop, forMode mode: RunLoop.Mode) {
+        init(handle: (() -> Void)?) {
             self.handle = handle
             self.renderQueue = DispatchQueue(label: "com.rive.renderQueue", qos: .userInteractive)
             
-            // Create display link with custom preferences
-            displayLink = CADisplayLink(target: self, selector: #selector(updateHandle))
-            if #available(iOS 15.0, *) {
-                displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
-            }
-            
-            // Important: Run on a background thread
-            let renderRunLoop = CFRunLoopGetCurrent()
-            displayLink?.add(to: .current, forMode: .default)
-            
-            // Start a background thread for the render loop
-            DispatchQueue.global(qos: .userInteractive).async {
-                // Create and run the render loop
-                let runLoop = RunLoop.current
-                runLoop.add(self.displayLink!, forMode: .default)
+            // Create a dedicated render thread
+            self.renderThread = Thread { [weak self] in
+                guard let self = self else { return }
                 
-                while true {
-                    autoreleasepool {
-                        runLoop.run(mode: .default, before: .distantFuture)
+                // Set up thread-local autorelease pool and run loop
+                autoreleasepool {
+                    // Create display link on the render thread
+                    self.displayLink = CADisplayLink(target: self, selector: #selector(self.updateHandle))
+                    if #available(iOS 15.0, *) {
+                        self.displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
                     }
+                    
+                    // Add to current thread's runloop
+                    self.displayLink?.add(to: .current, forMode: .default)
+                    
+                    // Run the loop
+                    RunLoop.current.run()
                 }
             }
+            
+            renderThread.name = "com.rive.renderThread"
+            renderThread.qualityOfService = .userInteractive
+            renderThread.start()
         }
         
         @objc func updateHandle() {
@@ -779,6 +777,7 @@ open class RiveView: RiveRendererView {
         func invalidate() {
             displayLink?.invalidate()
             displayLink = nil
+            renderThread.cancel()
         }
     }
 #else
