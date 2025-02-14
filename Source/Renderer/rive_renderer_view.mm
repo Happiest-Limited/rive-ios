@@ -24,6 +24,7 @@
     RenderContext* _renderContext;
     rive::Renderer* _renderer;
     dispatch_queue_t _renderQueue;
+    dispatch_queue_t _renderRunLoop;
     CADisplayLink* _displayLink;
     NSMutableArray<id<CAMetalDrawable>>* _drawablePool;
     NSLock* _drawableLock;
@@ -38,6 +39,7 @@
 - (void)commonInit 
 {
     _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
+    _renderRunLoop = dispatch_queue_create("com.rive.renderRunLoop", DISPATCH_QUEUE_SERIAL);
     _renderContext = [[RenderContextManager shared] getDefaultContext];
     assert(_renderContext);
     
@@ -56,10 +58,23 @@
     _drawableLock = [[NSLock alloc] init];
     _isDrawing = NO;
     
-    // Configure display link
-    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
-    _displayLink.paused = YES;
-    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    // Configure display link on background thread
+    dispatch_async(_renderRunLoop, ^{
+        self->_displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+        if (@available(iOS 15.0, *)) {
+            self->_displayLink.preferredFrameRateRange = CAFrameRateRange.defaultRange;
+        }
+        self->_displayLink.paused = YES;
+        
+        NSRunLoop* runLoop = [NSRunLoop currentRunLoop];
+        [self->_displayLink addToRunLoop:runLoop forMode:NSRunLoopCommonModes];
+        
+        while (true) {
+            @autoreleasepool {
+                [runLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
+            }
+        }
+    });
 }
 
 // Override to prevent any automatic drawing
@@ -241,11 +256,9 @@
 {
     if (_isDrawing) return;
     
-    // Throttle frame rate
     CFTimeInterval currentTime = CACurrentMediaTime();
     CFTimeInterval deltaTime = currentTime - _lastFrameTime;
     
-    // Target ~60fps
     if (deltaTime >= 0.016) {
         _isDrawing = YES;
         _lastFrameTime = currentTime;

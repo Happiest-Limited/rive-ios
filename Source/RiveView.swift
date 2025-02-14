@@ -733,41 +733,50 @@ open class RiveView: RiveRendererView {
     fileprivate class DisplayLinkProxy {
         var displayLink: CADisplayLink?
         private var handle: (() -> Void)?
-        private var runloop: RunLoop
-        private var mode: RunLoop.Mode
         private var lastFrameTime: CFTimeInterval = 0
+        private let renderQueue: DispatchQueue
         
         init(handle: (() -> Void)?, to runloop: RunLoop, forMode mode: RunLoop.Mode) {
             self.handle = handle
-            self.runloop = runloop
-            self.mode = mode
+            self.renderQueue = DispatchQueue(label: "com.rive.renderQueue", qos: .userInteractive)
             
             // Create display link with custom preferences
             displayLink = CADisplayLink(target: self, selector: #selector(updateHandle))
-            displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
-            
-            // Important: Don't synchronize with display refresh
             if #available(iOS 15.0, *) {
                 displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 1, maximum: 120, preferred: 60)
             }
             
-            displayLink?.add(to: runloop, forMode: mode)
+            // Important: Run on a background thread
+            let renderRunLoop = CFRunLoopGetCurrent()
+            displayLink?.add(to: .current, forMode: .default)
+            
+            // Start a background thread for the render loop
+            DispatchQueue.global(qos: .userInteractive).async {
+                // Create and run the render loop
+                let runLoop = RunLoop.current
+                runLoop.add(self.displayLink!, forMode: .default)
+                
+                while true {
+                    autoreleasepool {
+                        runLoop.run(mode: .default, before: .distantFuture)
+                    }
+                }
+            }
         }
         
         @objc func updateHandle() {
-            // Throttle updates to avoid overwhelming the renderer
             let currentTime = CACurrentMediaTime()
             let deltaTime = currentTime - lastFrameTime
             
-            // Aim for ~60fps (16.7ms between frames)
             if deltaTime >= 0.016 {
-                handle?()
+                renderQueue.async {
+                    self.handle?()
+                }
                 lastFrameTime = currentTime
             }
         }
         
         func invalidate() {
-            displayLink?.remove(from: runloop, forMode: mode)
             displayLink?.invalidate()
             displayLink = nil
         }
