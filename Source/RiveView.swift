@@ -15,13 +15,25 @@ open class RiveView: RiveRendererView {
 
     // MARK: Configuration
     internal weak var riveModel: RiveModel?
-    internal var fit: RiveFit = .contain { didSet { needsDisplay() } }
-    internal var alignment: RiveAlignment = .center { didSet { needsDisplay() } }
+    internal var fit: RiveFit = .contain { 
+        didSet { 
+            redraw()
+        } 
+    }
+    internal var alignment: RiveAlignment = .center { 
+        didSet { 
+            redraw()
+        } 
+    }
     /// The scale factor to apply when using the `layout` fit. By default, this value is -1, where Rive will determine
     /// the correct scale for your device.To override this default behavior, set this value to a value greater than 0. This value should
     /// only be set at the view model level and passed into this view.
     /// - Note: If the scale factor <= 0, nothing will be drawn.
-    internal var layoutScaleFactor: Double = RiveView.Constants.layoutScaleFactorAutomatic { didSet { needsDisplay() } }
+    internal var layoutScaleFactor: Double = RiveView.Constants.layoutScaleFactorAutomatic { 
+        didSet { 
+            redraw()
+        } 
+    }
     /// The internally calculated layout scale to use if a scale is not set by the developer (i.e layoutScaleFactor == -1)
     /// Defaults to the "legacy" methods, which will be overridden
     /// by window handlers in this view when the window changes.
@@ -33,7 +45,7 @@ open class RiveView: RiveRendererView {
         return scale
         #endif
     }() {
-        didSet { needsDisplay() }
+        didSet { redraw() }
     }
     /// Sets whether or not the Rive view should forward Rive listener touch / click events to any next responders.
     /// When true, touch / click events will be forwarded to any next responder(s).
@@ -61,13 +73,13 @@ open class RiveView: RiveRendererView {
 
     open override var bounds: CGRect {
         didSet {
-            redrawIfNecessary()
+            redraw()
         }
     }
 
     open override var frame: CGRect {
         didSet {
-            redrawIfNecessary()
+            redraw()
         }
     }
 
@@ -103,7 +115,7 @@ open class RiveView: RiveRendererView {
         if #available(iOS 17, tvOS 17, visionOS 1, *) {
             registerForTraitChanges([UITraitHorizontalSizeClass.self, UITraitVerticalSizeClass.self]) { [weak self] (_: UITraitEnvironment, traitCollection: UITraitCollection) in
                 guard let self else { return }
-                self.redrawIfNecessary()
+                self.redraw()
             }
         }
 
@@ -119,7 +131,7 @@ open class RiveView: RiveRendererView {
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         orientationObserver = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
-            self.redrawIfNecessary()
+            self.redraw()
         }
         #endif
 
@@ -154,33 +166,14 @@ open class RiveView: RiveRendererView {
         screenObserver = nil
     }
 
-    private func needsDisplay() {
-        #if os(iOS) || os(visionOS) || os(tvOS)
-            setNeedsDisplay()
-        #else
-            needsDisplay=true
-        #endif
+    private func redraw() {
+        if !isPlaying {
+            let bounds = self.bounds
+            DispatchQueue.global(qos: .userInteractive).async {
+                self.drawInRect(bounds, withCompletion: nil)
+            }
+        }
     }
-
-    #if os(iOS) || os(tvOS)
-    open override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard let scale = window?.windowScene?.screen.scale else { return }
-        _layoutScaleFactor = scale
-    }
-    #elseif os(visionOS)
-    open override func didMoveToWindow() {
-        super.didMoveToWindow()
-        let scale = traitCollection.displayScale
-        _layoutScaleFactor = scale
-    }
-    #else
-    open override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard let scale = window?.screen?.backingScaleFactor else { return }
-        _layoutScaleFactor = scale
-    }
-    #endif
 
     /// This resets the view with the new model. Useful when the `RiveView` was initialized without one.
     open func setModel(_ model: RiveModel, autoPlay: Bool = true) throws {
@@ -273,21 +266,17 @@ open class RiveView: RiveRendererView {
     // MARK: - Render Loop
     
     private func startTimer() {
+        stopTimer()
         
-        if displayLinkProxy == nil {
-            displayLinkProxy = DisplayLinkProxy(
-                handle: { [weak self] in
-                    self?.tick()
-                },
-                to: .main,
-                forMode: .common
-            )
-        }
-        #if os(iOS) || os(visionOS)
-            if displayLinkProxy?.displayLink?.isPaused == true {
-                displayLinkProxy?.displayLink?.isPaused = false
-            }
-        #endif
+        displayLinkProxy = DisplayLinkProxy(
+            handle: { [weak self] in
+                guard let self = self else { return }
+                
+                self.eventQueue.fireAll()
+            },
+            to: .main,
+            forMode: .common
+        )
     }
     
     private func stopTimer() {
@@ -389,7 +378,7 @@ open class RiveView: RiveRendererView {
         playerDelegate?.player(didAdvanceby: delta, riveModel: riveModel)
         
         // Trigger a redraw
-        needsDisplay()
+        redraw()
     }
     /// This is called in the middle of drawRect. Override this method to implement
     /// custom draw logic
@@ -424,7 +413,7 @@ open class RiveView: RiveRendererView {
         if #unavailable(iOS 17) {
             if traitCollection.horizontalSizeClass != previousTraitCollection?.horizontalSizeClass
                 || traitCollection.verticalSizeClass != previousTraitCollection?.verticalSizeClass {
-                redrawIfNecessary()
+                redraw()
             }
 
             if traitCollection.displayScale != previousTraitCollection?.displayScale {
@@ -669,12 +658,6 @@ open class RiveView: RiveRendererView {
         if !showFPS {
             fpsCounter?.removeFromSuperview()
             fpsCounter = nil
-        }
-    }
-
-    private func redrawIfNecessary() {
-        if isPlaying == false {
-            needsDisplay()
         }
     }
 }
