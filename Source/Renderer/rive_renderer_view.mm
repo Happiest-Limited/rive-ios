@@ -153,6 +153,7 @@
 {
     RenderContext* _renderContext;
     rive::Renderer* _renderer;
+    dispatch_queue_t _renderQueue;
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -200,15 +201,20 @@
 #endif
     self = [super initWithCoder:decoder];
 
-    _renderContext = [[RenderContextManager shared] getDefaultContext];
-    assert(_renderContext);
-    self.device = [_renderContext metalDevice];
+    if (self) {
+        // Create a serial queue for rendering
+        _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
+        
+        // Rest of existing initialization
+        _renderContext = [[RenderContextManager shared] getDefaultContext];
+        assert(_renderContext);
+        self.device = [_renderContext metalDevice];
 
-    [self setDepthStencilPixelFormat:_renderContext.depthStencilPixelFormat];
-    [self setColorPixelFormat:MTLPixelFormatBGRA8Unorm];
-    [self setFramebufferOnly:_renderContext.framebufferOnly];
-    [self setSampleCount:1];
-
+        [self setDepthStencilPixelFormat:_renderContext.depthStencilPixelFormat];
+        [self setColorPixelFormat:MTLPixelFormatBGRA8Unorm];
+        [self setFramebufferOnly:_renderContext.framebufferOnly];
+        [self setSampleCount:1];
+    }
     return self;
 }
 
@@ -237,6 +243,7 @@
                name:NSApplicationWillBecomeActiveNotification
              object:nil];
 #endif
+    _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
     _renderContext = [[RenderContextManager shared] getDefaultContext];
     assert(_renderContext);
 
@@ -328,6 +335,7 @@
 - (void)drawInRect:(CGRect)rect
     withCompletion:(_Nullable MTLCommandBufferHandler)completionHandler
 {
+    // Capture scale on main thread
     CGFloat scale = -1;
 #if TARGET_OS_IPHONE
     CGFloat displayScale = self.traitCollection.displayScale;
@@ -342,15 +350,31 @@
         scale = window.backingScaleFactor;
     }
 #endif
+
+    // If we're on the main thread, dispatch to background
+    if ([NSThread isMainThread]) {
+        dispatch_async(_renderQueue, ^{
+            [self drawInRect:rect withCompletion:completionHandler];
+        });
+        return;
+    }
+
+    // Check if we can draw
     if ([_renderContext canDrawInRect:rect
-                         drawableSize:self.drawableSize
-                                scale:scale] == NO)
+                        drawableSize:self.drawableSize
+                               scale:scale] == NO)
     {
         return;
     }
 
-    if (![[self currentDrawable] texture])
+    // Get drawable (now with retry logic built into currentDrawable)
+    id<CAMetalDrawable> drawable = [self currentDrawable];
+    if (!drawable.texture)
     {
+        // If we couldn't get a drawable, schedule another draw
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setNeedsDisplay:YES];
+        });
         return;
     }
 
@@ -361,19 +385,39 @@
         [self drawRive:rect size:self.drawableSize];
         _renderer->restore();
     }
-    [_renderContext endFrame:self withCompletion:completionHandler];
+    
+    // Complete rendering and present
+    [_renderContext endFrame:self withCompletion:^(id<MTLCommandBuffer> _Nonnull buffer) {
+        // Handle completion on main thread if needed
+        if (completionHandler) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completionHandler(buffer);
+            });
+        }
+        
+        // Update view state on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            bool paused = [self isPaused];
+            [self setEnableSetNeedsDisplay:paused];
+            [self setPaused:paused];
+        });
+    }];
 
     _renderer = nil;
-
-    bool paused = [self isPaused];
-    [self setEnableSetNeedsDisplay:paused];
-    [self setPaused:paused];
 }
 
 - (void)drawRect:(CGRect)rect
 {
     [super drawRect:rect];
-
+    
+    // If we're on the main thread, dispatch to background
+    if ([NSThread isMainThread]) {
+        dispatch_async(_renderQueue, ^{
+            [self drawInRect:rect withCompletion:NULL];
+        });
+        return;
+    }
+    
     [self drawInRect:rect withCompletion:NULL];
 }
 
@@ -480,6 +524,35 @@
     rive::Vec2D convertedLocation = inverse * frameLocation;
 
     return CGPointMake(convertedLocation.x, convertedLocation.y);
+}
+
+// Update currentDrawable implementation to avoid blocking main thread
+- (nullable id<CAMetalDrawable>)currentDrawable
+{
+    // If we're on the main thread, return immediately to avoid blocking
+    if ([NSThread isMainThread]) {
+        return [self metalLayer].nextDrawable;
+    }
+    
+    // If we're already on a background thread, we can try a few times with shorter timeouts
+    for (int attempt = 0; attempt < 3; attempt++) {
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        __block id<CAMetalDrawable> drawable = nil;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            drawable = [self metalLayer].nextDrawable;
+            dispatch_semaphore_signal(semaphore);
+        });
+        
+        // Use a shorter timeout (16ms = roughly one frame)
+        if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC)) == 0) {
+            if (drawable) {
+                return drawable;
+            }
+        }
+    }
+    
+    return nil;
 }
 
 @end
