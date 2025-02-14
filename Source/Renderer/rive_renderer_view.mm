@@ -156,8 +156,8 @@
     dispatch_queue_t _renderQueue;
     CADisplayLink* _displayLink;
     NSMutableArray<id<CAMetalDrawable>>* _drawablePool;
-    dispatch_semaphore_t _drawableSemaphore;
     NSLock* _drawableLock;
+    BOOL _isDrawing;
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -267,15 +267,20 @@
     
     // Initialize drawable management
     _drawablePool = [NSMutableArray arrayWithCapacity:3];
-    _drawableSemaphore = dispatch_semaphore_create(3);
     _drawableLock = [[NSLock alloc] init];
+    _isDrawing = NO;
     
-    // Disable automatic drawing
+    // Completely disable MTKView's drawing mechanism
     self.enableSetNeedsDisplay = NO;
     self.paused = YES;
+    self.preferredFramesPerSecond = 60;  // Set default FPS
     
-    // Set up display link
+    // Override the layer class
+    self.layer.delegate = self;
+    
+    // Set up our own display link
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+    _displayLink.paused = YES;
     [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
@@ -294,69 +299,63 @@
 
 - (nullable id<CAMetalDrawable>)currentDrawable
 {
-    // Try to get a drawable from the pool first
+    if ([NSThread isMainThread]) {
+        return [self.metalLayer nextDrawable];
+    }
+    
     [_drawableLock lock];
     id<CAMetalDrawable> drawable = [_drawablePool firstObject];
     if (drawable) {
         [_drawablePool removeObjectAtIndex:0];
         [_drawableLock unlock];
         
-        // Prefetch a new drawable to replace the one we just took
+        // Prefetch next drawable
         dispatch_async(dispatch_get_main_queue(), ^{
-            id<CAMetalDrawable> newDrawable = [self metalLayer].nextDrawable;
-            if (newDrawable) {
-                [_drawableLock lock];
-                [_drawablePool addObject:newDrawable];
-                [_drawableLock unlock];
+            if (id<CAMetalDrawable> newDrawable = [self.metalLayer nextDrawable]) {
+                [self->_drawableLock lock];
+                [self->_drawablePool addObject:newDrawable];
+                [self->_drawableLock unlock];
             }
         });
-        
         return drawable;
     }
     [_drawableLock unlock];
     
-    // If pool is empty, try to get a new drawable with a short timeout
+    // If no drawable in pool, get one from main thread
     __block id<CAMetalDrawable> newDrawable = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        newDrawable = [self metalLayer].nextDrawable;
-        dispatch_semaphore_signal(semaphore);
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        newDrawable = [self.metalLayer nextDrawable];
     });
-    
-    // Wait with a very short timeout
-    if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_MSEC)) == 0) {
-        return newDrawable;
-    }
-    
-    return nil;
+    return newDrawable;
 }
 
 - (void)startAnimation 
 {
-    // Prefetch drawables before starting animation
-    [self prefetchDrawables];
-    _displayLink.paused = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_displayLink.paused = NO;
+    });
 }
 
 - (void)stopAnimation 
 {
-    _displayLink.paused = YES;
-    
-    // Clear the drawable pool
-    [_drawableLock lock];
-    [_drawablePool removeAllObjects];
-    [_drawableLock unlock];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self->_displayLink.paused = YES;
+        [self->_drawableLock lock];
+        [self->_drawablePool removeAllObjects];
+        [self->_drawableLock unlock];
+    });
 }
 
 - (void)handleDisplayLink:(CADisplayLink*)displayLink 
 {
-    // Check if we have drawables available before dispatching
-    if (_drawablePool.count > 0) {
-        dispatch_async(_renderQueue, ^{
-            [self drawInRect:self.bounds withCompletion:NULL];
-        });
-    }
+    if (_isDrawing) return;
+    
+    _isDrawing = YES;
+    dispatch_async(_renderQueue, ^{
+        [self drawInRect:self.bounds withCompletion:^(id<MTLCommandBuffer> _Nullable buffer) {
+            self->_isDrawing = NO;
+        }];
+    });
 }
 
 - (void)drawInRect:(CGRect)rect
@@ -402,9 +401,14 @@
     _renderer = nil;
 }
 
-- (void)drawRect:(CGRect)rect
+- (void)drawRect:(CGRect)rect 
 {
-    // Do nothing - we handle drawing via display link
+    // Completely disable MTKView drawing
+}
+
+- (void)display 
+{
+    // Completely disable layer delegate drawing
 }
 
 - (void)dealloc 
