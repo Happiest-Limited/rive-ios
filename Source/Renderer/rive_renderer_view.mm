@@ -17,48 +17,10 @@
 #define WITH_RIVE_AUDIO
 #include "rive/audio/audio_engine.hpp"
 
-#if TARGET_OS_VISION
-@interface RiveMTKView : UIView <RiveMetalDrawableView>
-#else
-@interface RiveMTKView : UIView <RiveMetalDrawableView>  // Changed from MTKView
-#endif
-
-@property(nonatomic) MTLPixelFormat colorPixelFormat;
-@property(nonatomic) CGSize drawableSize;
-@property(nonatomic) BOOL framebufferOnly;
-@property(nonatomic) NSInteger sampleCount;
-@property(nonatomic, strong) id<MTLDevice> device;
-@property(nonatomic) MTLPixelFormat depthStencilPixelFormat;
-@property(nonatomic) BOOL enableSetNeedsDisplay;
-@property(nonatomic) BOOL paused;
-
+@interface RiveRendererView : UIView <RiveMetalDrawableView>
 @end
 
-@implementation RiveMTKView
-
-+ (Class)layerClass {
-    return [CAMetalLayer class];
-}
-
-- (CAMetalLayer *)metalLayer {
-    return (CAMetalLayer *)self.layer;
-}
-
-- (void)setDevice:(id<MTLDevice>)device {
-    _device = device;
-    self.metalLayer.device = device;
-}
-
-- (id<CAMetalDrawable>)currentDrawable {
-    return self.metalLayer.nextDrawable;
-}
-
-// ... implement other required properties ...
-
-@end
-
-@implementation RiveRendererView
-{
+@implementation RiveRendererView {
     RenderContext* _renderContext;
     rive::Renderer* _renderer;
     dispatch_queue_t _renderQueue;
@@ -67,6 +29,89 @@
     NSLock* _drawableLock;
     BOOL _isDrawing;
     CFTimeInterval _lastFrameTime;
+}
+
++ (Class)layerClass {
+    return [CAMetalLayer class];
+}
+
+- (void)commonInit 
+{
+    _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
+    _renderContext = [[RenderContextManager shared] getDefaultContext];
+    assert(_renderContext);
+    
+    // Configure metal layer
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    metalLayer.device = [_renderContext metalDevice];
+    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.framebufferOnly = YES;
+    metalLayer.presentsWithTransaction = NO;
+    metalLayer.displaySyncEnabled = NO;
+    metalLayer.allowsNextDrawableTimeout = NO;
+    metalLayer.maximumDrawableCount = 3;
+    
+    // Initialize drawable management
+    _drawablePool = [NSMutableArray arrayWithCapacity:3];
+    _drawableLock = [[NSLock alloc] init];
+    _isDrawing = NO;
+    
+    // Configure display link
+    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+    _displayLink.paused = YES;
+    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+// Override to prevent any automatic drawing
+- (void)display {
+    // Do nothing
+}
+
+- (void)setNeedsDisplay {
+    // Do nothing
+}
+
+- (void)drawRect:(CGRect)rect {
+    // Do nothing
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    
+    // Update metal layer size without triggering a draw
+    CGSize size = self.bounds.size;
+    CGFloat scale = self.window.screen.scale;
+    
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
+    self.drawableSize = metalLayer.drawableSize;
+}
+
+// Implement RiveMetalDrawableView protocol
+- (id<CAMetalDrawable>)currentDrawable {
+    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
+    
+    // Try pool first
+    [_drawableLock lock];
+    id<CAMetalDrawable> drawable = [_drawablePool firstObject];
+    if (drawable) {
+        [_drawablePool removeObjectAtIndex:0];
+        [_drawableLock unlock];
+        
+        // Prefetch next drawable
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (id<CAMetalDrawable> newDrawable = [metalLayer nextDrawable]) {
+                [self->_drawableLock lock];
+                [self->_drawablePool addObject:newDrawable];
+                [self->_drawableLock unlock];
+            }
+        });
+        return drawable;
+    }
+    [_drawableLock unlock];
+    
+    // If no drawable in pool, get one without blocking
+    return [metalLayer nextDrawable];
 }
 
 - (void)didEnterBackground:(NSNotification*)notification
@@ -162,37 +207,6 @@
     return value;
 }
 
-- (void)commonInit 
-{
-    _renderQueue = dispatch_queue_create("com.rive.renderQueue", DISPATCH_QUEUE_SERIAL);
-    _renderContext = [[RenderContextManager shared] getDefaultContext];
-    assert(_renderContext);
-    
-    // Configure metal layer
-    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
-    metalLayer.device = [_renderContext metalDevice];
-    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    metalLayer.framebufferOnly = YES;
-    metalLayer.presentsWithTransaction = NO;
-    metalLayer.displaySyncEnabled = NO;
-    metalLayer.allowsNextDrawableTimeout = NO;  // Important: prevent timeout blocking
-    
-    // Initialize drawable management
-    _drawablePool = [NSMutableArray arrayWithCapacity:3];
-    _drawableLock = [[NSLock alloc] init];
-    _isDrawing = NO;
-    
-    _lastFrameTime = 0;
-    
-    // Configure display link for optimal performance
-    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
-    if (@available(iOS 15.0, *)) {
-        _displayLink.preferredFrameRateRange = CAFrameRateRange.defaultRange;
-    }
-    _displayLink.paused = YES;
-    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-}
-
 - (void)prefetchDrawables {
     dispatch_async(dispatch_get_main_queue(), ^{
         for (int i = 0; i < 3; i++) {
@@ -204,33 +218,6 @@
             }
         }
     });
-}
-
-- (nullable id<CAMetalDrawable>)currentDrawable
-{
-    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
-    
-    // Always try pool first to avoid blocking
-    [_drawableLock lock];
-    id<CAMetalDrawable> drawable = [_drawablePool firstObject];
-    if (drawable) {
-        [_drawablePool removeObjectAtIndex:0];
-        [_drawableLock unlock];
-        
-        // Prefetch next drawable without blocking
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (id<CAMetalDrawable> newDrawable = [metalLayer nextDrawable]) {
-                [self->_drawableLock lock];
-                [self->_drawablePool addObject:newDrawable];
-                [self->_drawableLock unlock];
-            }
-        });
-        return drawable;
-    }
-    [_drawableLock unlock];
-    
-    // If no drawable in pool, try a quick non-blocking get
-    return [metalLayer nextDrawable];
 }
 
 - (void)startAnimation 
@@ -312,16 +299,6 @@
     }
     
     _renderer = nil;
-}
-
-- (void)drawRect:(CGRect)rect 
-{
-    // Do nothing - prevent MTKView from drawing
-}
-
-- (void)display 
-{
-    // Completely disable layer delegate drawing
 }
 
 - (void)dealloc 
@@ -510,25 +487,6 @@
     rive::Vec2D convertedLocation = inverse * frameLocation;
 
     return CGPointMake(convertedLocation.x, convertedLocation.y);
-}
-
-// Override to prevent MTKView from drawing
-- (void)setNeedsDisplay 
-{
-    // Do nothing - prevent MTKView from triggering draws
-}
-
-- (void)layoutSubviews 
-{
-    [super layoutSubviews];
-    
-    CGSize size = self.bounds.size;
-    CGFloat scale = self.window.screen.scale;
-    
-    // Update metal layer size
-    CAMetalLayer *metalLayer = (CAMetalLayer *)self.layer;
-    metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
-    self.drawableSize = metalLayer.drawableSize;
 }
 
 @end

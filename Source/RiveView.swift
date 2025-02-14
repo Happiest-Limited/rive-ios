@@ -173,12 +173,14 @@ open class RiveView: RiveRendererView {
     }
 
     private func redraw() {
-        // Only redraw if we're not playing
-        if !isPlaying {
-            // Dispatch directly to render queue
+        // Only redraw if we're not playing and not currently drawing
+        if !isPlaying && !isDrawing {
             DispatchQueue.global(qos: .userInteractive).async { [weak self] in
                 guard let self = self else { return }
-                self.drawInRect(self.bounds, withCompletion: nil)
+                self.isDrawing = true
+                self.drawInRect(self.bounds) { _ in
+                    self.isDrawing = false
+                }
             }
         }
     }
@@ -280,13 +282,17 @@ open class RiveView: RiveRendererView {
             handle: { [weak self] in
                 guard let self = self else { return }
                 
-                // Dispatch drawing to background queue
+                // Dispatch drawing to background queue immediately
                 DispatchQueue.global(qos: .userInteractive).async {
-                    self.drawInRect(self.bounds) { buffer in
-                        // Handle completion on main queue if needed
-                        if let completion = buffer?.handler {
-                            DispatchQueue.main.async {
-                                completion()
+                    if !self.isDrawing {
+                        self.isDrawing = true
+                        self.drawInRect(self.bounds) { buffer in
+                            self.isDrawing = false
+                            // Handle completion on main queue if needed
+                            if let completion = buffer?.handler {
+                                DispatchQueue.main.async {
+                                    completion()
+                                }
                             }
                         }
                     }
@@ -683,7 +689,11 @@ open class RiveView: RiveRendererView {
 
     // Override to prevent MTKView's draw cycle
     open override func setNeedsDisplay() {
-        // Do nothing - prevent MTKView from triggering draws
+        // Do nothing
+    }
+
+    open override func display() {
+        // Do nothing
     }
 }
 
